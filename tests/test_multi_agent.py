@@ -42,10 +42,27 @@ from src.agent.skills.synthesis import (
     strategy_opinion_from_agent_opinion,
     StrategySynthesizer,
 )
+from src.agent.skills.scheduler import SkillBatchResult
 from src.agent.skills.aggregator import SkillAggregator
 from src.agent.stock_scope import StockScope, resolve_stock_scope
 from src.config import AGENT_MAX_STEPS_DEFAULT, Config
 from src.storage import DatabaseManager
+
+
+class _FixedSkillWeightService:
+    """Deterministic local data source for Aggregator behavior tests."""
+
+    def __init__(self, weights=None, *, error=None):
+        self.weights = dict(weights or {})
+        self.error = error
+
+    def compute_weights(self, skill_ids):
+        if self.error is not None:
+            raise self.error
+        return {
+            skill_id: self.weights.get(skill_id, 1.0)
+            for skill_id in skill_ids
+        }
 
 
 # ============================================================
@@ -646,6 +663,115 @@ class TestStrategyAggregator(unittest.TestCase):
         # Average of buy(4) + sell(2) = 3.0, which maps to "hold"
         self.assertEqual(result.signal, "hold")
 
+    def test_bayesian_weight_changes_relative_skill_influence(self):
+        agg = SkillAggregator(
+            weight_service=_FixedSkillWeightService(
+                {"bull": 1.2, "bear": 1.0}
+            )
+        )
+        opinions = [
+            AgentOpinion(
+                agent_name="skill_bull",
+                signal="buy",
+                confidence=1.0,
+            ),
+            AgentOpinion(
+                agent_name="skill_bear",
+                signal="sell",
+                confidence=1.0,
+            ),
+        ]
+
+        result = agg.calculate(opinions)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.weights, [1.2, 1.0])
+        self.assertAlmostEqual(
+            result.weighted_score,
+            (4.0 * 1.2 + 2.0) / 2.2,
+        )
+        self.assertGreater(result.weighted_score, 3.0)
+
+    def test_outcome_weight_switch_disables_adjustment(self):
+        agg = SkillAggregator(
+            weight_service=_FixedSkillWeightService(
+                {"bull": 1.2, "bear": 1.0}
+            )
+        )
+        opinions = [
+            AgentOpinion(
+                agent_name="skill_bull",
+                signal="buy",
+                confidence=1.0,
+            ),
+            AgentOpinion(
+                agent_name="skill_bear",
+                signal="sell",
+                confidence=1.0,
+            ),
+        ]
+
+        with patch.object(
+            SkillAggregator,
+            "_use_outcome_autoweight",
+            return_value=False,
+        ):
+            result = agg.calculate(opinions)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.weights, [1.0, 1.0])
+        self.assertEqual(result.weighted_score, 3.0)
+
+    def test_outcome_weight_failure_keeps_aggregation_neutral(self):
+        agg = SkillAggregator(
+            weight_service=_FixedSkillWeightService(
+                error=RuntimeError("statistics unavailable")
+            )
+        )
+        opinions = [
+            AgentOpinion(
+                agent_name="skill_bull",
+                signal="buy",
+                confidence=1.0,
+            ),
+            AgentOpinion(
+                agent_name="skill_bear",
+                signal="sell",
+                confidence=1.0,
+            ),
+        ]
+
+        result = agg.calculate(opinions)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.weights, [1.0, 1.0])
+        self.assertEqual(result.weighted_score, 3.0)
+
+    def test_outcome_weight_consumer_rejects_unbounded_factor(self):
+        agg = SkillAggregator(
+            weight_service=_FixedSkillWeightService(
+                {"bull": 99.0, "bear": 0.01}
+            )
+        )
+        opinions = [
+            AgentOpinion(
+                agent_name="skill_bull",
+                signal="buy",
+                confidence=1.0,
+            ),
+            AgentOpinion(
+                agent_name="skill_bear",
+                signal="sell",
+                confidence=1.0,
+            ),
+        ]
+
+        result = agg.calculate(opinions)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.weights, [1.0, 1.0])
+        self.assertEqual(result.weighted_score, 3.0)
+
     def test_strategy_opinion_conversion_preserves_skill_payload(self):
         from src.agent.skills.synthesis import strategy_opinion_from_agent_opinion
 
@@ -733,8 +859,12 @@ class TestStrategyAggregator(unittest.TestCase):
 
         self.assertEqual(synthesis["final_signal"], "hold")
         self.assertEqual(synthesis["conflict_severity"], "high")
-        self.assertAlmostEqual(synthesis["confidence"], 0.68)
+        # high conflict severity first reduces 0.8 -> 0.68; mediator_v0 then
+        # applies a partially-resolved deliberation adjustment of -0.06.
+        self.assertAlmostEqual(synthesis["confidence"], 0.62)
         self.assertEqual(synthesis["summary_key"], "strategy_synthesis.with_conflicts")
+        self.assertEqual(synthesis["deliberation"]["status"], "completed")
+        self.assertEqual(synthesis["deliberation"]["mode"], "mediator_v0")
         self.assertNotIn("summary", synthesis)
         self.assertEqual(synthesis["summary_params"]["final_signal"], "hold")
         self.assertNotIn("综合信号", json.dumps(synthesis, ensure_ascii=False))
@@ -1009,6 +1139,23 @@ class TestOrchestratorModes(unittest.TestCase):
         self.assertEqual(ctx.stock_name, "贵州茅台")
         self.assertEqual(ctx.meta["skills_requested"], ["bull_trend"])
 
+    def test_specialist_builder_allows_four_requested_skills(self):
+        orch = self._make_orchestrator("specialist")
+        ctx = AgentContext(query="test", stock_code="600519")
+        ctx.meta["skills_requested"] = [
+            "bull_trend",
+            "hot_theme",
+            "fund_flow",
+            "chan_theory",
+        ]
+
+        agents = orch._build_specialist_agents(ctx)
+
+        self.assertEqual(
+            [agent.skill_id for agent in agents],
+            ["bull_trend", "hot_theme", "fund_flow", "chan_theory"],
+        )
+
     def test_build_context_keeps_market_phase_context_in_meta_not_data(self):
         orch = self._make_orchestrator()
         phase_context = {"phase": "intraday", "is_partial_bar": True}
@@ -1065,10 +1212,21 @@ class TestOrchestratorExecution(unittest.TestCase):
         )
 
     @staticmethod
-    def _stage_result(name, status=StageStatus.COMPLETED, error=None, raw_text="ok"):
+    def _stage_result(
+        name,
+        status=StageStatus.COMPLETED,
+        error=None,
+        raw_text="ok",
+        total_steps=0,
+        tool_calls_log=None,
+        failure_reason=None,
+    ):
         result = StageResult(stage_name=name, status=status, error=error)
+        result.total_steps = total_steps
+        result.failure_reason = failure_reason
         result.meta["raw_text"] = raw_text
         result.meta["models_used"] = ["test/model"]
+        result.meta["tool_calls_log"] = list(tool_calls_log or [])
         return result
 
     @staticmethod
@@ -1183,6 +1341,64 @@ class TestOrchestratorExecution(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("technical", result.error)
         self.assertEqual(result.total_tokens, 0)
+
+    def test_execute_pipeline_collects_whitelisted_stage_trajectories(self):
+        orch = self._make_orchestrator()
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = self._stage_result(
+            "technical",
+            total_steps=2,
+            tool_calls_log=[{"step": 1, "tool": "quote", "success": True}],
+        )
+        decision = MagicMock(agent_name="decision")
+        decision.run.return_value = self._stage_result(
+            "decision",
+            total_steps=1,
+            tool_calls_log=[{"step": 1, "tool": "trend", "success": True}],
+        )
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, decision]):
+            result = orch._execute_pipeline(AgentContext(query="test"), parse_dashboard=False)
+
+        assert [item["stage_name"] for item in result.stage_trajectories] == ["technical", "decision"]
+        assert [item["total_steps"] for item in result.stage_trajectories] == [2, 1]
+        assert result.stage_trajectories[0]["tool_calls_log"][0]["tool"] == "quote"
+        assert "raw_text" not in result.stage_trajectories[0]
+
+    def test_specialist_stage_trajectories_keep_scheduler_order(self):
+        orch = self._make_orchestrator()
+        orch.mode = "specialist"
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = self._stage_result("technical", total_steps=1)
+        decision = MagicMock(agent_name="decision")
+        decision.run.return_value = self._stage_result("decision", total_steps=1)
+        first = self._stage_result("strategy_bull", total_steps=2)
+        second = self._stage_result("strategy_volume", total_steps=3)
+        batch = SkillBatchResult(stage_results=[first, second], opinions=[])
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, decision]):
+            with patch.object(orch, "_build_specialist_agents", return_value=[MagicMock(), MagicMock()]):
+                with patch.object(orch, "_run_specialist_agent_batch", return_value=batch):
+                    result = orch._execute_pipeline(AgentContext(query="test"), parse_dashboard=False)
+
+        assert [item["stage_name"] for item in result.stage_trajectories] == [
+            "technical", "strategy_bull", "strategy_volume", "decision"
+        ]
+
+    def test_budget_boundary_adds_explicit_skipped_snapshot(self):
+        orch = self._make_orchestrator(config=SimpleNamespace(agent_orchestrator_timeout_s=20))
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = self._stage_result("technical", total_steps=1)
+        intel = MagicMock(agent_name="intel")
+        times = iter([0.0, 0.2, 0.3, 14.6, 14.7])
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, intel]):
+            with patch("src.agent.orchestrator.time.time", side_effect=lambda: next(times, 100.0)):
+                result = orch._execute_pipeline(AgentContext(query="test"))
+
+        assert result.stage_trajectories[-1]["stage_name"] == "intel"
+        assert result.stage_trajectories[-1]["status"] == "skipped"
+        assert result.stage_trajectories[-1]["failure_reason"] == "budget_skip"
 
     def test_execute_pipeline_degrades_on_intel_failure(self):
         orch = self._make_orchestrator()
@@ -1449,6 +1665,72 @@ class TestOrchestratorExecution(unittest.TestCase):
         self.assertIn('"stage_name": "chan_theory"', combined)
         self.assertIn('"non_critical_stage_present": true', combined)
         self.assertIn('"non_critical": true', combined)
+
+    def test_strategy_engine_preserves_scheduler_diagnostics(self):
+        orch = self._make_orchestrator()
+        ctx = AgentContext(
+            query="test",
+            stock_code="600519",
+            meta={
+                "invalid_opinions": [
+                    {
+                        "agent_name": "skill_fund_flow",
+                        "reason": "skill_timeout",
+                    }
+                ]
+            },
+        )
+        ctx.add_opinion(AgentOpinion(
+            agent_name="skill_hot_theme",
+            signal="moon",
+            confidence=0.9,
+            reasoning="bad fixture",
+        ))
+        ctx.add_opinion(AgentOpinion(
+            agent_name="skill_bull_trend",
+            signal="buy",
+            confidence=0.8,
+            reasoning="valid fixture",
+            raw_data={"skill_id": "bull_trend"},
+        ))
+
+        orch._run_strategy_engine(ctx)
+
+        invalid_bucket = ctx.meta["invalid_opinions"]
+        self.assertEqual([item["agent_name"] for item in invalid_bucket], [
+            "skill_fund_flow",
+            "skill_hot_theme",
+        ])
+        self.assertEqual(invalid_bucket[0]["reason"], "skill_timeout")
+        self.assertEqual(invalid_bucket[1]["reason"], "unrecognized_signal")
+        synthesis = ctx.get_data("skill_consensus")["strategy_synthesis"]
+        self.assertEqual(synthesis["summary_params"]["opinion_count"], 1)
+        self.assertEqual(synthesis["summary_params"]["invalid_opinion_count"], 2)
+        self.assertEqual(synthesis["summary_params"]["total_opinion_count"], 3)
+
+        from src.agent.agents.decision_agent import DecisionAgent
+        prompt = DecisionAgent(
+            tool_registry=MagicMock(),
+            llm_adapter=MagicMock(),
+        ).build_user_message(ctx)
+        self.assertIn("执行超时 1 个", prompt)
+        self.assertIn("signal 无法识别 1 个", prompt)
+
+    def test_specialist_batch_timeout_is_split_across_concurrency_waves(self):
+        orch = self._make_orchestrator(config=SimpleNamespace(agent_skill_concurrency=2))
+
+        self.assertEqual(
+            orch._skill_batch_timeout_slice(3, timeout_seconds=30),
+            15,
+        )
+        self.assertEqual(
+            orch._skill_batch_timeout_slice(4, timeout_seconds=30),
+            15,
+        )
+        self.assertEqual(
+            orch._skill_batch_timeout_slice(2, timeout_seconds=30),
+            30,
+        )
 
     def test_execute_pipeline_skips_stage_when_remaining_budget_below_minimum(self):
         orch = self._make_orchestrator(config=SimpleNamespace(agent_orchestrator_timeout_s=20))
@@ -1766,13 +2048,21 @@ class TestOrchestratorExecution(unittest.TestCase):
         from src.agent.orchestrator import OrchestratorResult
 
         orch = self._make_orchestrator()
-        fake_result = OrchestratorResult(success=True, content="done", total_steps=2, total_tokens=11, model="x")
+        fake_result = OrchestratorResult(
+            success=True,
+            content="done",
+            total_steps=2,
+            total_tokens=11,
+            model="x",
+            stage_trajectories=[{"stage_name": "technical", "status": "completed"}],
+        )
         with patch.object(orch, "_execute_pipeline", return_value=fake_result):
             result = orch.run("Analyze 600519")
 
         self.assertTrue(result.success)
         self.assertEqual(result.content, "done")
         self.assertEqual(result.total_steps, 2)
+        self.assertEqual(result.stage_trajectories[0]["stage_name"], "technical")
 
     def test_chat_loads_prior_history_into_context(self):
         from src.agent.orchestrator import OrchestratorResult
@@ -1791,7 +2081,8 @@ class TestOrchestratorExecution(unittest.TestCase):
         with patch.object(orch, "_execute_pipeline", side_effect=fake_execute):
             with patch("src.agent.orchestrator.build_visible_chat_history", return_value=history):
                 with patch("src.agent.conversation.conversation_manager.get_or_create"):
-                    with patch("src.agent.conversation.conversation_manager.add_message"):
+                    with patch("src.agent.conversation.conversation_manager.add_user_message"), \
+                         patch("src.agent.conversation.conversation_manager.add_message"):
                         orch.chat("hello", "session-1")
 
         self.assertEqual(captured["history"], history)
@@ -1804,7 +2095,8 @@ class TestOrchestratorExecution(unittest.TestCase):
         with patch.object(orch, "_execute_pipeline", return_value=OrchestratorResult(success=True, content="ok")):
             with patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]) as build_history:
                 with patch("src.agent.conversation.conversation_manager.get_or_create"):
-                    with patch("src.agent.conversation.conversation_manager.add_message"):
+                    with patch("src.agent.conversation.conversation_manager.add_user_message"), \
+                         patch("src.agent.conversation.conversation_manager.add_message"):
                         orch.chat("hello", "session-1")
 
         build_history.assert_called_once()
@@ -1824,7 +2116,8 @@ class TestOrchestratorExecution(unittest.TestCase):
         with patch.object(orch, "_execute_pipeline", side_effect=fake_execute):
             with patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]):
                 with patch("src.agent.conversation.conversation_manager.get_or_create"):
-                    with patch("src.agent.conversation.conversation_manager.add_message"):
+                    with patch("src.agent.conversation.conversation_manager.add_user_message"), \
+                         patch("src.agent.conversation.conversation_manager.add_message"):
                         orch.chat(
                             "换成 AAPL 看看",
                             "session-1",
@@ -1896,14 +2189,18 @@ class TestOrchestratorExecution(unittest.TestCase):
         orch = self._make_orchestrator()
         fake_result = OrchestratorResult(success=True, content="assistant reply")
 
-        with patch.object(orch, "_execute_pipeline", return_value=fake_result):
-            with patch("src.agent.conversation.conversation_manager.add_message") as add_message:
+        with patch.object(orch, "_execute_pipeline", return_value=fake_result), \
+             patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]):
+            with patch("src.agent.conversation.conversation_manager.commit_user_turn", return_value={"user_message_id": 1}) as add_user_message, \
+                 patch("src.agent.conversation.conversation_manager.add_message") as add_message:
                 result = orch.chat("hello", "session-1")
 
         self.assertTrue(result.success)
-        self.assertEqual(add_message.call_count, 2)
-        add_message.assert_any_call("session-1", "user", "hello")
-        add_message.assert_any_call("session-1", "assistant", "assistant reply")
+        self.assertEqual(add_user_message.call_count, 1)
+        self.assertEqual(add_user_message.call_args.args[1]["session_id"], "session-1")
+        self.assertEqual(add_user_message.call_args.args[2:], ("hello", None))
+        self.assertEqual(add_message.call_args.args, ("session-1", "assistant", "assistant reply"))
+        self.assertEqual(add_message.call_args.kwargs["accepted_turn"], {"user_message_id": 1})
 
     def test_chat_transaction_persists_user_before_multi_agent_execution(self):
         """SSE acceptance can occur after persistence but before the pipeline starts."""
@@ -1915,10 +2212,17 @@ class TestOrchestratorExecution(unittest.TestCase):
         with patch.object(orch, "_execute_pipeline", return_value=fake_result) as execute_pipeline:
             with patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]):
                 with patch("src.agent.conversation.conversation_manager.get_or_create"):
-                    with patch("src.agent.conversation.conversation_manager.add_message") as add_message:
-                        turn = orch.prepare_turn(message="hello", session_id="session-accepted")
+                    with patch("src.agent.conversation.conversation_manager.commit_user_turn", return_value={"user_message_id": 1}) as add_user_message, \
+                         patch("src.agent.conversation.conversation_manager.add_message") as add_message:
+                        turn = orch.prepare_turn(
+                            message="hello",
+                            session_id="session-accepted",
+                            selected_skill_ids=["technical"],
+                        )
 
-                        add_message.assert_called_once_with("session-accepted", "user", "hello")
+                        self.assertEqual(add_user_message.call_count, 1)
+                        self.assertEqual(add_user_message.call_args.args[1]["session_id"], "session-accepted")
+                        self.assertEqual(add_user_message.call_args.args[2:], ("hello", ["technical"]))
                         execute_pipeline.assert_not_called()
 
                         result = orch.execute_turn(turn)
@@ -1941,12 +2245,15 @@ class TestOrchestratorExecution(unittest.TestCase):
         orch = self._make_orchestrator()
         fake_result = OrchestratorResult(success=False, error="boom")
 
-        with patch.object(orch, "_execute_pipeline", return_value=fake_result):
-            with patch("src.agent.conversation.conversation_manager.add_message") as add_message:
+        with patch.object(orch, "_execute_pipeline", return_value=fake_result), \
+             patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]):
+            with patch("src.agent.conversation.conversation_manager.commit_user_turn", return_value={"user_message_id": 1}), \
+                 patch("src.agent.conversation.conversation_manager.add_message") as add_message:
                 result = orch.chat("hello", "session-2")
 
         self.assertFalse(result.success)
-        add_message.assert_any_call("session-2", "assistant", "[分析失败] boom")
+        self.assertEqual(add_message.call_args.args, ("session-2", "assistant", "[分析失败] boom"))
+        self.assertEqual(add_message.call_args.kwargs["accepted_turn"], {"user_message_id": 1})
 
     def test_execute_pipeline_fails_when_dashboard_parse_fails(self):
         orch = self._make_orchestrator()
@@ -2599,6 +2906,7 @@ class TestBaseAgentMemoryIntegration(unittest.TestCase):
         )
         memory = MagicMock(enabled=True)
         memory.get_stock_history.return_value = [entry]
+        memory.get_decision_signal_review.return_value = None
         agent = self._make_agent(memory)
 
         ctx = AgentContext(query="test", stock_code="600519")
@@ -2633,6 +2941,7 @@ class TestBaseAgentMemoryIntegration(unittest.TestCase):
     def test_memory_calibration_updates_confidence(self):
         memory = MagicMock(enabled=True)
         memory.get_stock_history.return_value = []
+        memory.get_decision_signal_review.return_value = None
         memory.get_calibration.return_value = SimpleNamespace(
             calibrated=True,
             calibration_factor=0.5,
@@ -2674,6 +2983,7 @@ class TestBaseAgentMemoryIntegration(unittest.TestCase):
 
         memory = MagicMock(enabled=True)
         memory.get_stock_history.return_value = []
+        memory.get_decision_signal_review.return_value = None
         memory.get_calibration.return_value = SimpleNamespace(
             calibrated=True,
             calibration_factor=0.5,
@@ -3511,6 +3821,41 @@ class TestStrategyEngineE2E(unittest.TestCase):
         self.assertEqual(params["total_opinion_count"], 5)
         self.assertEqual(result.invalid_count, 3)
         self.assertEqual(len(result.invalid_records), 3)
+
+    def test_engine_counts_scheduler_diagnostics_with_valid_opinions(self):
+        from src.agent.skills.engine import StrategyEngine, StrategyResultStatus
+
+        result = StrategyEngine().process(
+            [AgentOpinion(agent_name="skill_bull_trend", signal="buy", confidence=0.8)],
+            diagnostic_records=[{
+                "agent_name": "skill_hot_theme",
+                "reason": "skill_timeout",
+            }],
+        )
+
+        self.assertEqual(result.status, StrategyResultStatus.CONSENSUS)
+        params = result.synthesis_dict["summary_params"]
+        self.assertEqual(params["opinion_count"], 1)
+        self.assertEqual(params["invalid_opinion_count"], 1)
+        self.assertEqual(params["total_opinion_count"], 2)
+        self.assertEqual(result.invalid_records[0]["reason"], "skill_timeout")
+
+    def test_engine_builds_no_consensus_stub_for_scheduler_only_failure(self):
+        from src.agent.skills.engine import StrategyEngine, StrategyResultStatus
+
+        result = StrategyEngine().process(
+            [],
+            diagnostic_records=[{
+                "agent_name": "skill_hot_theme",
+                "reason": "skill_error",
+            }],
+        )
+
+        self.assertEqual(result.status, StrategyResultStatus.NO_CONSENSUS)
+        params = result.synthesis_dict["summary_params"]
+        self.assertEqual(params["opinion_count"], 0)
+        self.assertEqual(params["invalid_opinion_count"], 1)
+        self.assertEqual(params["total_opinion_count"], 1)
 
     # ------------------------------------------------------------------
     # 2. All invalid → NO_CONSENSUS stub
